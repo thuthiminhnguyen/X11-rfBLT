@@ -464,7 +464,7 @@ create_forecast_df <- function(dat_vec, df_true, df_pred, df_lower, df_upper, st
 # Dataset
 
 ```{r}
-electricity_per_KWH <- read_csv("D:/Dalhousie University/0. Project/Periodic ts/data/electricity per KWH.csv")
+electricity_per_KWH <- read_csv("D:/Dalhousie University/0. Project/X11-rfBLT/Electricity Price/electricity per KWH.csv")
 electricity_per_KWH$MON <- as.integer(sub("^M0?(\\d+)$", "\\1", electricity_per_KWH$Period))
 electricity_per_KWH$Month <- as.Date(paste(electricity_per_KWH$Year, 
                                            electricity_per_KWH$MON, "01", sep = "-"), 
