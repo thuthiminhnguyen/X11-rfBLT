@@ -1,0 +1,2079 @@
+Air
+
+---
+title: "Air Passenger - Long- and Short-term Prediction"
+author: "Thu Nguyen"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+# Library
+
+```{r}
+rm(list=ls())
+library(rfBLT)
+library(readr)
+library(MCMCpack)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(zoo)
+library(seasonal)
+library(forecast)
+library(plotly)
+library(matrixStats)
+library(lubridate)
+library(tidyverse)
+library(scatterplot3d)
+library(purrr)
+library(rsample)
+library(grid)
+library(plot3D)
+```
+
+# Function
+
+```{r}
+# Decompose ts
+trend_seasonal_x11_decomp <- function(df, fixed_point, s=12){
+  train_data <- df[1:fixed_point,]
+  test_data <- df[(fixed_point+1):nrow(df),]
+  
+  # Decompose train time series - Multiplicative
+  train_freq_ts <- ts(train_data$passengers, start = c(1949,  1), frequency = 12)
+  train_decomp <- train_freq_ts %>% seas(x11="", transform.function = "log")
+
+  # Seasonal 
+  train_seasonal <- seasonal(train_decomp)
+
+  # Trend + Remainder
+  train_trend_remainder <- trend(train_decomp)*remainder(train_decomp)
+  
+  return(list(train_seasonal=train_seasonal, train_trend_remainder=train_trend_remainder))
+}
+```
+
+```{r}
+# rfBLT - long-term prediction
+long_term_pred_rfBLT <- function(ts_dat, pred_size, window_size_rfBLTs=12, window_size_rfBLTtr=12, smooth_window_rfBLTtr=12, alpha=0.05){
+    # X11 decomposition - Multiplicative
+    x11_decomp <- ts_dat %>% seas(x11="", transform.function = "log") 
+    x11_seasonal_comp <- seasonal(x11_decomp)
+    x11_trend_random <- trend(x11_decomp)*remainder(x11_decomp)
+
+    # Fit Seasonal - no smoothing for seasonal component
+    fit_rfBLTs <- ts_forecast_bayes_reg_rfm_taken(
+        ts_data = as.vector(x11_seasonal_comp),
+        time = 1:length(x11_seasonal_comp),
+        smooth_diff = FALSE,
+        window_size = window_size_rfBLTs,
+        pred_size = pred_size,
+        weight_dist = "normal",
+        weight_params = list(),
+        bias_dist = "uniform",
+        bias_params = list(min_val = 0, max_val = 2*pi),
+        act_func = "fourier",
+        reg_type = "lasso",
+        burnin = 2000,
+        n.samples = 2000,
+        thin = 1,
+        n.cores = NULL,
+        pred_type = "mean",
+        feature_selection = "factor",
+        feature_constant = 1,
+        CI = 95
+    )
+
+    # Fit Trend*Random
+    fit_rfBLTtr <- ts_forecast_bayes_reg_rfm_taken(
+        ts_data = as.vector(x11_trend_random),
+        time = 1:length(x11_trend_random),
+        smooth_diff = TRUE,
+        method = "ma",
+        smooth_params = list(window=smooth_window_rfBLTtr),
+        window_size = window_size_rfBLTtr,
+        pred_size = pred_size,
+        weight_dist = "normal",
+        weight_params = list(),
+        bias_dist = "uniform",
+        bias_params = list(min_val = 0, max_val = 2*pi),
+        act_func = "fourier",
+        reg_type = "lasso",
+        burnin = 2000,
+        n.samples = 2000,
+        thin = 1,
+        n.cores = NULL,
+        pred_type = "mean",
+        feature_selection = "factor",
+        feature_constant = 1,
+        CI = 95
+    )
+
+    # Predicted Posterior
+    post_pred <- fit_rfBLTs$future_y_preds*fit_rfBLTtr$future_y_preds
+    post_pred_mean <- colMeans(post_pred)
+    post_pred_lower <- colQuantiles(post_pred, probs = c(alpha/2), na.rm = FALSE) 
+    post_pred_upper <- colQuantiles(post_pred, probs = c(1-alpha/2), na.rm = FALSE) 
+
+    return(list(x11_seasonal_comp=x11_seasonal_comp,
+                x11_trend_random=x11_trend_random,
+                post_pred_rfBLT=post_pred, 
+                post_pred_mean_rfBLT=post_pred_mean,
+                post_pred_lower_rfBLT=post_pred_lower,
+                post_pred_upper_rfBLT=post_pred_upper,
+                WAIC_rfBLTs = fit_rfBLTs$WAIC,
+                WAIC_rfBLTtr = fit_rfBLTtr$WAIC))
+}
+```
+
+```{r}
+# SARIMA - long-term prediction
+long_term_pred_sarima <- function(ts_dat, pred_size){
+    fit_sarima <- auto.arima(ts_dat, seasonal="TRUE")
+    forecast_sarima <- forecast(fit_sarima, h=pred_size)
+    pred_lower_sarima <- forecast_sarima$lower[,2]
+    pred_upper_sarima <- forecast_sarima$upper[,2]
+    pred_sarima <- forecast_sarima$mean
+
+    return(list(pred_sarima=pred_sarima, pred_lower_sarima=pred_lower_sarima, pred_upper_sarima=pred_upper_sarima))
+}
+```
+
+```{r}
+# Holt-Winters' additive - long-term prediction
+long_term_pred_hw_add <- function(ts_dat, pred_size){
+    fit_hw_add <- ets(ts_dat, model = "AAA")
+    forecast_hw <- forecast(fit_hw_add, h=pred_size)
+    pred_lower_hw_add <- forecast_hw$lower[,2]
+    pred_upper_hw_add <- forecast_hw$upper[,2]
+    pred_hw_add <- forecast_hw$mean
+
+    return(list(pred_hw_add=pred_hw_add, pred_lower_hw_add=pred_lower_hw_add, pred_upper_hw_add=pred_upper_hw_add))
+}
+```
+
+```{r}
+# STL - long-term prediction
+long_term_pred_slt <- function(ts_dat, pred_size){
+    fit_slt <- stlf(ts_dat, method='arima', h = pred_size)
+    forecast_slt <- forecast(fit_slt, h=pred_size)
+    pred_lower_slt <- forecast_slt$lower[,2]
+    pred_upper_slt <- forecast_slt$upper[,2]
+    pred_slt <- forecast_slt$mean
+
+    return(list(pred_slt=pred_slt, pred_lower_slt=pred_lower_slt, pred_upper_slt=pred_upper_slt))
+}
+```
+
+```{r}
+# Dynamic Harmonic Regression - long-term prediction
+long_term_pred_dhr <- function(ts_dat, pred_size){
+    # Find best k
+    min_aicc <- Inf
+
+    for(i in 1:6) {
+      fit <- auto.arima(ts_dat, xreg=fourier(ts_dat, K=i), seasonal=FALSE)
+      if(fit$aicc < min_aicc) {
+        min_aicc <- fit$aicc
+        best_k <- i
+      }
+    }
+    
+    fit_dhr <- auto.arima(ts_dat, xreg=fourier(ts_dat, K=best_k), seasonal=FALSE)
+    forecast_dhr <- forecast(fit_dhr, xreg=fourier(ts_dat, K=best_k, h=pred_size))
+    pred_lower_dhr <- forecast_dhr$lower[,2]
+    pred_upper_dhr <- forecast_dhr$upper[,2]
+    pred_dhr <- forecast_dhr$mean
+
+    return(list(pred_dhr=pred_dhr, pred_lower_dhr=pred_lower_dhr, pred_upper_dhr=pred_upper_dhr))
+}
+```
+
+```{r}
+# TBATS - long-term prediction
+long_term_pred_tbats <- function(ts_dat, pred_size){
+    fit_tbats <- tbats(ts_dat)
+    forecast_tbats <- forecast(fit_tbats, h=pred_size)
+    pred_lower_tbats <- forecast_tbats$lower[,2]
+    pred_upper_tbats <- forecast_tbats$upper[,2]
+    pred_tbats <- forecast_tbats$mean
+
+    return(list(pred_tbats=pred_tbats, pred_lower_tbats=pred_lower_tbats, pred_upper_tbats=pred_upper_tbats))
+}
+```
+
+```{r}
+# All methods - long-term prediction
+long_term_pred_all <- function(ts_dat, pred_size, window_size_rfBLTs=12, window_size_rfBLTtr=12, smooth_window_rfBLTtr=12, alpha=0.05){
+    n = length(ts_dat)
+    new_ts_dat <- ts(ts_dat[1:(n-pred_size)], start = c(1949,  1), frequency = 12)
+
+    # rfBLT
+    rfBLT_res <- long_term_pred_rfBLT(ts_dat=new_ts_dat, 
+                                      pred_size=pred_size, 
+                                      window_size_rfBLTs=window_size_rfBLTs, 
+                                      window_size_rfBLTtr=window_size_rfBLTtr, 
+                                      smooth_window_rfBLTtr=smooth_window_rfBLTtr, 
+                                      alpha=alpha)
+
+    # SARIMA
+    sarima_res <- long_term_pred_sarima(ts_dat=new_ts_dat, pred_size=pred_size)
+
+    # Holt-Winters’ additive
+    hw_add_res <- long_term_pred_hw_add(ts_dat=new_ts_dat, pred_size=pred_size)
+
+    # SLT
+    slt_res <- long_term_pred_slt(ts_dat=new_ts_dat, pred_size=pred_size)
+
+    # Dynamic Harmonic Regression
+    dhr_res <- long_term_pred_dhr(ts_dat=new_ts_dat, pred_size=pred_size)
+
+    # TBATS
+    tbats_res <- long_term_pred_tbats(ts_dat=new_ts_dat, pred_size=pred_size)
+
+    return(list(rfBLT_res=rfBLT_res, 
+                sarima_res=sarima_res,
+                hw_add_res=hw_add_res,
+                slt_res=slt_res,
+                dhr_res=dhr_res,
+                tbats_res=tbats_res))
+}
+```
+
+```{r}
+plot_forecast <- function(data,
+                          month_col,
+                          value_col,
+                          pred_mean,
+                          pred_lower,
+                          pred_upper,
+                          pred_size,
+                          history_len = 50,
+                          method_name = "Forecast",
+                          y_label = "Value",
+                          y_limits = NULL) {   # <-- NEW
+  
+  # -----------------------------
+  # Basic checks
+  # -----------------------------
+  stopifnot(length(pred_mean)  == pred_size,
+            length(pred_lower) == pred_size,
+            length(pred_upper) == pred_size)
+  
+  n <- length(data[[value_col]])
+  
+  # True future values
+  true_values <- data[[value_col]][(n - (pred_size - 1)):n]
+  
+  # Indices
+  hist_start <- max(1, n - pred_size - history_len + 1)
+  hist_end   <- n - pred_size
+  pred_end   <- n
+  
+  # -----------------------------
+  # Build dataframe
+  # -----------------------------
+  plot_df <- data.frame(
+    month = data[[month_col]][hist_start:pred_end],
+    
+    observed = c(
+      data[[value_col]][hist_start:hist_end],
+      true_values
+    ),
+    
+    predicted_mean = c(
+      rep(NA, hist_end - hist_start + 1),
+      pred_mean
+    ),
+    
+    lower_95 = c(
+      rep(NA, hist_end - hist_start + 1),
+      pred_lower
+    ),
+    
+    upper_95 = c(
+      rep(NA, hist_end - hist_start + 1),
+      pred_upper
+    )
+  )
+  
+  # -----------------------------
+  # Base plot
+  # -----------------------------
+  p <- ggplot(plot_df, aes(x = month)) +
+    
+    # geom_ribbon(
+    #   aes(ymin = lower_95, ymax = upper_95, fill = "95% PI"),
+    #   alpha = 0.2,
+    #   na.rm = TRUE
+    # ) +
+    
+    geom_line(
+      aes(y = predicted_mean, color = "Prediction"),
+      linewidth = 1.2,
+      na.rm = TRUE
+    ) +
+    
+    geom_line(
+      aes(y = observed, color = "Observed"),
+      linewidth = 1
+    ) +
+    
+    geom_vline(
+      xintercept = data[[month_col]][hist_end],
+      linetype = "dashed"
+    ) +
+    
+    labs(
+      title = paste(method_name),
+      x = "Month",
+      y = y_label,
+      color = "Legend" #,
+      # fill = "Legend"
+    ) +
+    
+    scale_color_manual(
+      values = c(
+        "Observed" = "gray40",
+        "Prediction" = "red"
+      )
+    ) +
+    
+    # scale_fill_manual(
+    #   values = c("95% PI" = "blue")
+    # ) +
+    
+    theme_minimal() +
+    theme(
+      legend.position = "top",
+      legend.title = element_blank(),
+      plot.title = element_text(size = 12),
+      axis.title.x = element_text(size = 10),
+      axis.title.y = element_text(size = 10)
+    )
+  
+  # -----------------------------
+  # Optional y-axis scaling
+  # -----------------------------
+  if (!is.null(y_limits)) {
+    p <- p + coord_cartesian(ylim = y_limits)
+  }
+  
+  return(p)
+}
+```
+
+```{r}
+# Compute percentage of coverage and their range
+coverage_fn <- function(df_true, df_upper, df_lower) {
+  # Percentage of Coverage
+  prop_cover = colMeans(df_upper >= df_true & df_lower <= df_true)
+  # Range of Coverage
+  cr_range_mat = df_upper - df_lower
+  return(list(prop_cover=prop_cover, cr_range_mat = cr_range_mat))
+}
+```
+
+```{r}
+# Generate a dataframe for predictions
+create_forecast_df <- function(dat_vec, df_true, df_pred, df_lower, df_upper, start_index, end_index) {
+  df_nrow <- nrow(df_true)
+  df_ncol <- ncol(df_true)
+  n_dat <- length(dat_vec)
+  
+  # Initialize data frame
+  data <- data.frame(
+    train_time = numeric(),
+    forecast_day = numeric(),
+    horizon = numeric(),
+    predicted_mean = numeric(),
+    lower_95 = numeric(),
+    upper_95 = numeric(),
+    observed = numeric()
+  )
+  
+  # Loop through each row of df_true
+  for (i in 1:df_nrow) {
+    train_time <- df_true[i, 1]
+    for (j in 2:df_ncol) {
+      horizon <- j - 1
+      forecast_day <- train_time + horizon
+      if (forecast_day <= end_index) {
+        new_row <- data.frame(
+          train_time = train_time,
+          forecast_day = forecast_day,
+          horizon = horizon,
+          predicted_mean = df_pred[i, j],
+          lower_95 = df_lower[i, j],
+          upper_95 = df_upper[i, j],
+          observed = dat_vec[forecast_day]
+        )
+        data <- rbind(data, new_row)
+      }
+    }
+  }
+  
+  return(data)
+}
+```
+
+# Dataset
+
+```{r}
+df_air <- data.frame(
+    date = as.Date(as.yearmon(time(AirPassengers))),
+    passengers = as.numeric(AirPassengers)
+  )
+
+df_air <- df_air %>%
+  mutate(month_num = month(date))
+
+color_main   <- "#2B6CB0"  
+color_focus  <- "#E53E3E"  
+color_inset  <- "#2B6CB0"  
+color_bg     <- "#FAFAFA" 
+
+ns_main_plot <- ggplot(df_air, aes(x = date, y = passengers)) +
+  geom_line(color = color_main, alpha = 0.8, linewidth = 0.8) + 
+  labs(x = "Month", y = "Number of Passengers") + #, title = "Monthly Airline Passengers"
+  scale_x_date(date_breaks = "1 years", date_labels = "%Y") + 
+  theme_minimal() +
+  theme(
+    # CHANGED: Reduced from 180 to 130 to make the full plot taller
+    plot.margin = margin(10, 10, 10, 10), 
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    plot.title = element_text(vjust = 3, face = "bold") # Lowered slightly to match the margin
+  )
+
+pdf("D:/Dalhousie University/0. Project/latex/rfBLT/rfBLT seasonal/air_passengers_data.pdf", width = 10, height = 3.5)
+ns_main_plot
+dev.off()
+```
+
+```{r}
+# 3D plot
+delta_t <- 1
+ts_dat  <- df_air$passengers
+n       <- length(ts_dat)
+
+df_3d <- data.frame(
+  xt      = ts_dat[1:(n - 2 * delta_t)],
+  xt_lag1 = ts_dat[(1 + delta_t):(n - delta_t)],
+  xt_lag2 = ts_dat[(1 + 2 * delta_t):n]
+)
+# ----------------------
+
+pdf("D:/Dalhousie University/0. Project/latex/rfBLT/rfBLT seasonal/air_static_3d_phase_space.pdf", width = 6, height = 5.5)
+par(mar = c(3, 3, 3, 4))
+
+lines3D(
+  x = df_3d$xt, 
+  y = df_3d$xt_lag1, 
+  z = df_3d$xt_lag2,
+  colvar = df_3d$xt,          # Smoothly changes color based on temperature value
+  col = hcl.colors(100, "Viridis"), # Matches your exact choice of colorscale
+  lwd = 2,                  # Sharp, clear line thickness
+  
+  # --- PERSPECTIVE & ROTATION CONTROLS ---
+  theta = 40,                 # Azimuth angle (Rotate horizontally to turn the box)
+  phi = 20,                   # Colatitude angle (Rotate vertically to tilt up/down)
+  
+  # --- GRID & BOX STYLING ---
+  bty = "g",                 # "b2" draws a modern gray background panel with gridlines
+  ticktype = "detailed",      # Draws explicit numerical values on the axes edges
+  colkey = list(length = 0.6, width = 0.4, cex.axis = 0.8), # Clean colorbar legend
+  
+  # --- LABELS ---
+  xlab = "x(t)", 
+  ylab = paste0("x(t + ", delta_t, ")"), 
+  zlab = paste0("x(t + ", 2 * delta_t, ")"),
+  cex.main = 0.9, cex.lab = 0.9, color.palette = "Viridis",
+  cex.axis = 0.75
+)
+dev.off()
+```
+
+```{r}
+# ACF
+pdf("D:/Dalhousie University/0. Project/latex/rfBLT/rfBLT seasonal/air_acf.pdf", width = 8, height = 5)
+acf(as.numeric(AirPassengers), main="", lag.max=100)
+dev.off()
+```
+
+# X11-ARIMA
+
+```{r}
+x11_decomp <- AirPassengers %>% seas(x11="", transform.function = "log") 
+pdf("D:/Dalhousie University/0. Project/latex/rfBLT/rfBLT seasonal/air_x11.pdf", width = 8, height = 5)
+autoplot(x11_decomp)
+dev.off()
+```
+
+```{r, fig.width = 12, fig.height = 3}
+# Extract components cleanly
+trend_comp    <- as.numeric(trend(x11_decomp)*remainder(x11_decomp))
+seasonal_comp <- as.numeric(seasonal(x11_decomp))
+
+# Compute ACF and format natively into Data Frames
+get_acf_df <- function(series_data, max_lag = 100) {
+  acf_obj <- acf(series_data, lag.max = max_lag, plot = FALSE)
+  # Drop lag 0 (which is always 1.0) so it doesn't distort the scale of your plot
+  data.frame(
+    Lag = acf_obj$lag[-1],
+    ACF = acf_obj$acf[-1]
+  )
+}
+
+df_trend_acf    <- get_acf_df(trend_comp)
+df_seasonal_acf <- get_acf_df(seasonal_comp)
+
+# Calculate the standard 95% confidence interval threshold bounds
+ci_threshold <- 1.96 / sqrt(length(trend_comp))
+
+# Build the custom ggplot structures (Empty main titles for LaTeX)
+p_trend <- ggplot(df_trend_acf, aes(x = Lag, xend = Lag, y = 0, yend = ACF)) +
+  geom_segment(color = "#2B6CB0", linewidth = 0.5) +  # Fixed function name here
+  geom_hline(yintercept = c(-ci_threshold, ci_threshold), color = "#E53E3E", linetype = "dashed", linewidth = 0.4) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.3) +
+  labs(title = "", x = "Lag", y = "ACF") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid.minor = element_blank())
+
+p_seasonal <- ggplot(df_seasonal_acf, aes(x = Lag, xend = Lag, y = 0, yend = ACF)) +
+  geom_segment(color = "#9B2C2C", linewidth = 0.5) +  # Fixed function name here
+  geom_hline(yintercept = c(-ci_threshold, ci_threshold), color = "#E53E3E", linetype = "dashed", linewidth = 0.4) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.3) +
+  labs(title = "", x = "Lag", y = "ACF") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid.minor = element_blank())
+
+# Combine side-by-side perfectly using patchwork
+combined_acf_plots <- p_trend | p_seasonal
+
+pdf("D:/Dalhousie University/0. Project/latex/rfBLT/rfBLT seasonal/air_comp_acf.pdf", width = 12, height = 3)
+combined_acf_plots
+dev.off()
+```
+
+```{r, fig.width = 6, fig.height = 5.5}
+# --- 3D plot ---
+# Prep data
+delta_t <- 1
+ts_dat  <- trend_comp
+n       <- length(ts_dat)
+
+df_3d <- data.frame(
+  xt      = ts_dat[1:(n - 2 * delta_t)],
+  xt_lag1 = ts_dat[(1 + delta_t):(n - delta_t)],
+  xt_lag2 = ts_dat[(1 + 2 * delta_t):n]
+)
+# ----------------------
+custom_blue_ramp <- colorRampPalette(c("#EBF8FF", "#2B6CB0"))
+
+pdf("D:/Dalhousie University/0. Project/latex/rfBLT/rfBLT seasonal/air_trend_static_3d_phase_space.pdf", width = 6, height = 5.5)
+# Set margin parameters to make room for labels
+par(mar = c(3, 3, 3, 4))
+
+# Draw the static 3D line trajectory with your custom blue gradient
+lines3D(
+  x = df_3d$xt, 
+  y = df_3d$xt_lag1, 
+  z = df_3d$xt_lag2,
+  colvar = df_3d$xt,          
+  
+  # CHANGED: Replaced hcl.colors with your custom hex gradient
+  col = custom_blue_ramp(100), 
+  
+  lwd = 2,                  
+  
+  # --- PERSPECTIVE & ROTATION CONTROLS ---
+  theta = 40,                 
+  phi = 20,                   
+  
+  # --- GRID & BOX STYLING ---
+  bty = "g",                 
+  ticktype = "detailed",      
+  colkey = list(length = 0.6, width = 0.4, cex.axis = 0.8), 
+  
+  # --- LABELS ---
+  xlab = "x(t)", 
+  ylab = paste0("x(t + ", delta_t, ")"), 
+  zlab = paste0("x(t + ", 2 * delta_t, ")"),
+  cex.main = 0.9, cex.lab = 0.9, 
+  cex.axis = 0.75
+)
+dev.off()
+```
+
+```{r, fig.width = 6, fig.height = 5.5}
+# Prep data
+delta_t <- 1
+ts_dat  <- seasonal_comp
+n       <- length(ts_dat)
+
+df_3d <- data.frame(
+  xt      = ts_dat[1:(n - 2 * delta_t)],
+  xt_lag1 = ts_dat[(1 + delta_t):(n - delta_t)],
+  xt_lag2 = ts_dat[(1 + 2 * delta_t):n]
+)
+# ----------------------
+custom_red_ramp <- colorRampPalette(c("#FFF5F5", "#9B2C2C"))
+
+pdf("D:/Dalhousie University/0. Project/latex/rfBLT/rfBLT seasonal/air_seasonal_static_3d_phase_space.pdf", width = 6, height = 5.5)
+# Set margin parameters to make room for labels
+par(mar = c(3, 3, 3, 4))
+
+# Draw the static 3D line trajectory with your custom red gradient
+lines3D(
+  x = df_3d$xt, 
+  y = df_3d$xt_lag1, 
+  z = df_3d$xt_lag2,
+  colvar = df_3d$xt,          
+  
+  # UPDATED: Passing the new red gradient palette
+  col = custom_red_ramp(100), 
+  
+  lwd = 2,                  
+  
+  # --- PERSPECTIVE & ROTATION CONTROLS ---
+  theta = 40,                 
+  phi = 20,                   
+  
+  # --- GRID & BOX STYLING ---
+  bty = "g",                 
+  ticktype = "detailed",      
+  colkey = list(length = 0.6, width = 0.4, cex.axis = 0.8), 
+  
+  # --- LABELS ---
+  xlab = "x(t)", 
+  ylab = paste0("x(t + ", delta_t, ")"), 
+  zlab = paste0("x(t + ", 2 * delta_t, ")"),
+  cex.main = 0.9, cex.lab = 0.9, 
+  cex.axis = 0.75
+)
+dev.off()
+```
+
+# 24-month prediction
+
+```{r}
+# Cross-validation
+n <- length(AirPassengers)
+pred_size=24
+embed_dim <- c(12, 15, 18, 21, 24)
+df <- df_air[1:(n-pred_size),1:2]
+colnames(df) <- c("date", "value")
+nrow(df)
+
+splits <- rolling_origin(
+  df, 
+  initial = 70,   
+  assess = 24,     
+  skip = 5,       
+  cumulative = TRUE # Expanding window
+)
+
+# Create a list where each element is a list containing 'train' and 'test'
+folds_list <- map(splits$splits, function(s) {
+  list(
+    train = analysis(s),
+    test  = assessment(s)
+  )
+})
+
+length(folds_list)
+```
+
+```{r}
+# This will return a matrix: Rows = embed_dim, Columns = folds
+mse_matrix_24m <- sapply(folds_list, function(fold) {
+  
+  # Inner loop over each dimension for this specific fold
+  sapply(embed_dim, function(d) {
+    
+    # 1. Create the ts object
+    new_ts_dat <- ts(fold$train[, 2], start = c(1949, 01), frequency = 12)
+    
+    # 2. Run the model
+    rfBLT_res <- long_term_pred_rfBLT(
+        ts_dat=new_ts_dat, 
+        pred_size=pred_size, 
+        window_size_rfBLTs=d, 
+        window_size_rfBLTtr=d, 
+        smooth_window_rfBLTtr=12, 
+        alpha=0.05
+    )
+    
+    # 3. Calculate MSE for this d/fold combination
+    mean((rfBLT_res$post_pred_mean_rfBLT - fold$test$value)^2)
+  })
+})
+
+# Add names for clarity
+rownames(mse_matrix_24m) <- paste0("dim_", embed_dim)
+colnames(mse_matrix_24m) <- paste0("fold_", seq_along(folds_list))
+```
+
+```{r}
+# Results of all methods
+res_all_24m <- long_term_pred_all(ts_dat=df_air$passengers, 
+                                  pred_size=pred_size, 
+                                  window_size_rfBLTs=embed_dim[which.min(final_mean_mse_24m)], 
+                                  window_size_rfBLTtr=embed_dim[which.min(final_mean_mse_24m)], 
+                                  smooth_window_rfBLTtr=12, 
+                                  alpha=0.05)
+
+# Save results
+save(# Long-term
+    mse_matrix_24m,
+    res_all_24m,
+
+    file = "200726_air_passengers_x11_long_term_pred_results.RData"
+)
+```
+
+```{r}
+# Load results
+load("D:/Dalhousie University/0. Project/X11-rfBLT/Air Passengers/200726_air_passengers_x11_long_term_pred_results.RData")
+```
+
+```{r}
+# Plot prediction result
+p_rfBLT_x11 <- plot_forecast(
+  data = df_air,
+  month_col = "date",
+  value_col = "passengers",
+  pred_mean = res_all_24m$rfBLT_res$post_pred_mean_rfBLT,
+  pred_lower = res_all_24m$rfBLT_res$post_pred_lower_rfBLT,
+  pred_upper = res_all_24m$rfBLT_res$post_pred_upper_rfBLT,
+  pred_size = 24,
+  history_len = 48,
+  method_name = "X11-rfBLT",
+  y_label = "Number of Passengers",
+  y_limits = c(200, 630)
+)
+
+p_sarima <- plot_forecast(
+  data = df_air,
+  month_col = "date",
+  value_col = "passengers",
+  pred_mean = res_all_24m$sarima_res$pred_sarima,
+  pred_lower = res_all_24m$sarima_res$pred_lower_sarima,
+  pred_upper = res_all_24m$sarima_res$pred_upper_sarima,
+  pred_size = 24,
+  history_len = 48,
+  method_name = "SARIMA",
+  y_label = "Number of Passengers",
+  y_limits = c(200, 630)
+)
+
+p_hw_add <- plot_forecast(
+  data = df_air,
+  month_col = "date",
+  value_col = "passengers",
+  pred_mean = res_all_24m$hw_add_res$pred_hw_add,
+  pred_lower = res_all_24m$hw_add_res$pred_lower_hw_add,
+  pred_upper = res_all_24m$hw_add_res$pred_upper_hw_add,
+  pred_size = 24,
+  history_len = 48,
+  method_name = "Holt-Winters’ Additive",
+  y_label = "Number of Passengers",
+  y_limits = c(200, 630)
+)
+
+p_slt <- plot_forecast(
+  data = df_air,
+  month_col = "date",
+  value_col = "passengers",
+  pred_mean = res_all_24m$slt_res$pred_slt,
+  pred_lower = res_all_24m$slt_res$pred_lower_slt,
+  pred_upper = res_all_24m$slt_res$pred_upper_slt,
+  pred_size = 24,
+  history_len = 48,
+  method_name = "STL",
+  y_label = "Number of Passengers",
+  y_limits = c(200, 630)
+)
+
+p_dhr <- plot_forecast(
+  data = df_air,
+  month_col = "date",
+  value_col = "passengers",
+  pred_mean = res_all_24m$dhr_res$pred_dhr,
+  pred_lower = res_all_24m$dhr_res$pred_lower_dhr,
+  pred_upper = res_all_24m$dhr_res$pred_upper_dhr,
+  pred_size = 24,
+  history_len = 48,
+  method_name = "Dynamic Harmonic Regression",
+  y_label = "Number of Passengers",
+  y_limits = c(200, 630)
+)
+
+p_tbats <- plot_forecast(
+  data = df_air,
+  month_col = "date",
+  value_col = "passengers",
+  pred_mean = res_all_24m$tbats_res$pred_tbats,
+  pred_lower = res_all_24m$tbats_res$pred_lower_tbats,
+  pred_upper = res_all_24m$tbats_res$pred_upper_tbats,
+  pred_size = 24,
+  history_len = 48,
+  method_name = "TBATS",
+  y_label = "Number of Passengers",
+  y_limits = c(200, 630)
+)
+```
+
+```{r}
+embed_dim <- c(12, 15, 18, 21, 24)
+print("Cross-validation Mean MSE")
+mse_matrix_24m
+rowMeans(mse_matrix_24m)
+embed_dim[which.min(rowMeans(mse_matrix_24m))]
+```
+
+```{r, fig.height=8, fig.width=12}
+pdf("D:/Dalhousie University/0. Project/latex/rfBLT/rfBLT seasonal/air_long_term_forecast.pdf", width = 12, height = 8)
+(p_rfBLT_x11|p_sarima)/(p_hw_add|p_slt)/(p_dhr|p_tbats)
+dev.off()
+```
+
+```{r}
+# MSE
+long_term_true <- df_air$passengers[(nrow(df_air)-23):(nrow(df_air))]
+long_mse_rfBLT <- mean((long_term_true-res_all_24m$rfBLT_res$post_pred_mean_rfBLT)^2)
+long_mse_sarima <- mean((long_term_true-res_all_24m$sarima_res$pred_sarima)^2)
+long_mse_hw_add <- mean((long_term_true-res_all_24m$hw_add_res$pred_hw_add)^2)
+long_mse_slt <- mean((long_term_true-res_all_24m$slt_res$pred_slt)^2)
+long_mse_dhr <- mean((long_term_true-res_all_24m$dhr_res$pred_dhr)^2)
+long_mse_tbats <- mean((long_term_true-res_all_24m$tbats_res$pred_tbats)^2)
+
+cbind(c("rfBLT", "SARIMA", "HWA", "STL", "DHR", "TBATS"),
+round(c(long_mse_rfBLT, long_mse_sarima, long_mse_hw_add, long_mse_slt, long_mse_dhr, long_mse_tbats), 4))
+```
+
+# 6-month prediction
+
+```{r}
+# --- Save true data ---
+# Starting point for prediction
+fixed_point <- 80
+pred_size <- 6
+nrow(df_air)
+
+# --- Create empty data frame to save results ---
+start_train_point <- fixed_point
+last_train_point <- nrow(df_air)-pred_size
+df_nrow <- length(start_train_point:last_train_point)
+df_ncol = pred_size+1
+
+# True trend matrix corresponding to the each of each training period
+df_true <- data.frame(matrix(ncol = df_ncol, nrow = df_nrow))
+colnames(df_true) <- c("training_point", paste0("t", 1:pred_size))
+df_true$training_point <- start_train_point:last_train_point
+
+# Prediction trend matrix corresponding to the each of each training period
+df_pred_rfBLT <- df_true
+df_lower_rfBLT <- df_true
+df_upper_rfBLT <- df_true
+
+# Prediction seasonal matrix corresponding to the each of each training period
+df_pred_seasonal <- df_true
+df_lower_seasonal <- df_true
+df_upper_seasonal <- df_true
+
+# Prediction trend+seasonal matrix corresponding to the each of each training period
+df_pred_all <- df_true
+df_lower_all <- df_true
+df_upper_all <- df_true
+
+for (i in 1:df_nrow){
+  end_period <- df_true[i, 1]
+  
+  vec_dat <- df_air$passengers
+  df_true[i, 2:df_ncol] <- vec_dat[(end_period+1):(end_period+pred_size)]
+}
+
+keep_point <- seq(min(df_true[,1]), max(df_true[,1]), 15)
+```
+
+```{r}
+# --- Cross-validation ---
+embed_dim <- c(12, 15, 18, 21, 24)
+df <- df_air[1:fixed_point,1:2]
+colnames(df) <- c("date", "value")
+nrow(df)
+
+splits <- rolling_origin(
+  df, 
+  initial = 50,   
+  assess = pred_size,     
+  skip = 5,       
+  cumulative = TRUE # Expanding window
+)
+
+# Create a list where each element is a list containing 'train' and 'test'
+folds_list <- map(splits$splits, function(s) {
+  list(
+    train = analysis(s),
+    test  = assessment(s)
+  )
+})
+
+length(folds_list) 
+
+# This will return a matrix: Rows = embed_dim, Columns = folds
+mse_matrix_6m <- sapply(folds_list, function(fold) {
+  
+  # Inner loop over each dimension for this specific fold
+  sapply(embed_dim, function(d) {
+    
+    # 1. Create the ts object
+    new_ts_dat <- ts(fold$train[, 2], start = c(1949, 01), frequency = 12)
+    
+    # 2. Run the model
+    rfBLT_res <- long_term_pred_rfBLT(
+        ts_dat=new_ts_dat, 
+        pred_size=pred_size, 
+        window_size_rfBLTs=d, 
+        window_size_rfBLTtr=d, 
+        smooth_window_rfBLTtr=12, 
+        alpha=0.05
+    )
+    
+    # 3. Calculate MSE for this d/fold combination
+    mean((rfBLT_res$post_pred_mean_rfBLT - fold$test$value)^2)
+  })
+})
+
+# Add names for clarity
+rownames(mse_matrix_6m) <- paste0("dim_", embed_dim)
+colnames(mse_matrix_6m) <- paste0("fold_", seq_along(folds_list))
+```
+
+```{r}
+# --- Fit rfBLT for Trend*Irregular ---
+# 1. Define the worker function
+process_rfBLT <- function(i, df_true, df_air, window_size, pred_size) {
+  index <- df_true[i, 1]
+  res <- trend_seasonal_x11_decomp(df = df_air, fixed_point = index)
+  
+  train_vec <- as.vector(res$train_trend_remainder)[1:index]
+  train_mat <- embed(train_vec, (window_size + 1))
+  
+  # Fit model
+  fit_rfBLT <- ts_forecast_bayes_reg_rfm_taken(
+    ts_data = as.vector(train_vec),
+    time = 1:length(train_vec),
+    smooth_diff = TRUE,
+    method = "ma",
+    smooth_params = list(window = 12),
+    window_size = window_size,
+    pred_size = pred_size,
+    weight_dist = "normal",
+    weight_params = list(),
+    bias_dist = "uniform",
+    bias_params = list(min_val = 0, max_val = 2*pi),
+    act_func = "fourier",
+    reg_type = "lasso",
+    burnin = 2000,
+    n.samples = 2000,
+    thin = 1,
+    n.cores = NULL, # Handled by the apply wrapper if needed
+    pred_type = "mean",
+    feature_selection = "factor",
+    feature_constant = 1,
+    CI = 95
+  )
+  
+  # Residuals and ACF
+  residuals <- train_mat[, 1] - fit_rfBLT$fitted.values
+  residual_acf <- acf(residuals, lag.max=68, plot=FALSE)$acf
+  
+  # Return a named list of all outputs for this iteration
+  list(
+    residuals = residuals,
+    acf = as.vector(residual_acf),
+    coef = fit_rfBLT$posterior_samples,
+    sigma2 = fit_rfBLT$posterior_sigma2,
+    ess = fit_rfBLT$ess,
+    pred_trend = fit_rfBLT$future_y_preds,
+    y_pred = fit_rfBLT$y_pred,
+    ci = fit_rfBLT$pred.ci
+  )
+}
+
+# 2. Run the process (Functional way)
+# Replace 'lapply' with 'future_lapply' if you use the 'future.apply' package for speed.
+results <- lapply(1:df_nrow, process_rfBLT, 
+                  df_true = df_true, 
+                  df_air = df_air, 
+                  window_size = embed_dim[which.min(final_mean_mse_6m)], 
+                  pred_size = pred_size)
+
+# 3. Post-process the results back into your matrices/lists
+coef_list   <- lapply(results, `[[`, "coef")
+sigma2_list <- lapply(results, `[[`, "sigma2")
+ess_list    <- lapply(results, `[[`, "ess")
+pred_trend_list <- lapply(results, `[[`, "pred_trend")
+
+# Fill Matrices using row binding or manual assignment
+# ACF matrix (excluding the first column which is training_point)
+df_residuals_acf <- matrix(NA, nrow=df_nrow, ncol=70)
+df_residuals_acf[,1] <- df_true[,1]
+colnames(df_residuals_acf) <- c("training_point", paste0(0:(ncol(df_residuals_acf)-2)))
+df_residuals_acf[, -1] <- do.call(rbind, lapply(results, `[[`, "acf"))
+
+# Predictions and CI matrices
+df_pred_rfBLT[, 2:df_ncol]  <- do.call(rbind, lapply(results, `[[`, "y_pred"))
+df_lower_rfBLT[, 2:df_ncol] <- do.call(rbind, lapply(results, function(x) x$ci[, 1]))
+df_upper_rfBLT[, 2:df_ncol] <- do.call(rbind, lapply(results, function(x) x$ci[, 2]))
+
+# Residuals training matrix (handling potential length mismatches)
+residual_trend_train_mat <- matrix(NA, nrow=df_nrow, ncol=nrow(df_air))
+for(i in 1:df_nrow) {
+  resids <- results[[i]]$residuals
+  residual_trend_train_mat[i, 1:length(resids)] <- resids
+}
+
+# --- Save diagnostic result ---
+# Effective sample size
+pdf("rfBLTtr_6m_ess.pdf", width=7, height=5)
+par(mfrow=c(1, 1))
+for (i in 1:df_nrow){
+    plot(ess_list[[i]])
+}
+dev.off()
+
+# ACF and QQ plots of residuals
+pdf("rfBLTtr_6m_residuals.pdf", width=10, height=4)
+par(mfrow=c(1, 2))
+for (i in 1:nrow(df_residuals_acf)){
+  # ACF of residuals
+  plot(df_residuals_acf[i, -1], type="h", ylab="ACF", xlab="Lag", main=paste(i))
+  # QQ plot of residuals
+  qqnorm(na.omit(residual_trend_train_mat[i,]), main=paste(i))
+  qqline(na.omit(residual_trend_train_mat[i,]))
+}
+dev.off()
+
+# Trace plots of coefficients
+pdf("rfBLTtr_6m_coefs_samples.pdf", width=15, height=20)
+par(mfrow=c(6, 3))
+for (i in 1:ncol(coef_list[[df_nrow]])){
+  plot(coef_list[[df_nrow]][,i], type="l", main=paste0("Tract plot of Beta ", i-1), ylab=paste0("Beta ", i-1))
+  hist(coef_list[[df_nrow]][,i], probability = TRUE, main=paste0("Density of Beta ", i-1), xlab=paste0("Beta ", i-1))
+  boxplot(coef_list[[df_nrow]][,i], horizontal=TRUE, main=paste0("Box plot of Beta ", i-1))
+}
+dev.off()
+
+# Trace plot of sigma2
+pdf("rfBLTtr_6m_sigma2_samples.pdf", width=15, height=4)
+par(mfrow=c(1, 3))
+plot(sigma2_list[[df_nrow]], type="l", ylab="Sigma2", main="Trace plot of Sigma2")
+hist(sigma2_list[[df_nrow]], probability = TRUE, main=paste0("Density of Sigma2"), xlab=paste0("Sigma2"))
+boxplot(sigma2_list[[df_nrow]], horizontal=TRUE, main="Box plot of Sigma2")
+dev.off()
+```
+
+```{r}
+# --- Fit rfBLT for seasonal component ---
+# 1. Define the worker function for the seasonal component
+process_seasonal_rfBLT <- function(i, df_true, df_air, pred_size, window_size) {
+  index <- df_true[i, 1]
+  res <- trend_seasonal_x11_decomp(df = df_air, fixed_point = index)
+  
+  # Focus on the seasonal component
+  train_vec <- as.vector(res$train_seasonal)[1:index]
+  train_mat <- embed(train_vec, (window_size+1)) # Window size + 1
+  
+  # Fit model
+  fit_rfBLT <- ts_forecast_bayes_reg_rfm_taken(
+    ts_data = as.vector(train_vec),
+    time = 1:length(train_vec),
+    smooth_diff = FALSE,
+    window_size = window_size,
+    pred_size = pred_size,
+    weight_dist = "normal",
+    weight_params = list(),
+    bias_dist = "uniform",
+    bias_params = list(min_val = 0, max_val = 2 * pi),
+    act_func = "fourier",
+    reg_type = "lasso",
+    burnin = 2000,
+    n.samples = 2000,
+    thin = 1,
+    n.cores = NULL,
+    pred_type = "mean",
+    feature_selection = "factor",
+    feature_constant = 1,
+    CI = 95
+  )
+  
+  # Calculate Residuals and ACF
+  residuals <- train_mat[, 1] - fit_rfBLT$fitted.values
+  residual_acf <- acf(residuals, lag.max=68, plot=FALSE)$acf
+  
+  # Return results as a structured list
+  list(
+    residuals = residuals,
+    acf = as.vector(residual_acf),
+    coef = fit_rfBLT$posterior_samples,
+    sigma2 = fit_rfBLT$posterior_sigma2,
+    ess = fit_rfBLT$ess,
+    pred_seasonal = fit_rfBLT$future_y_preds,
+    y_pred = fit_rfBLT$y_pred,
+    ci = fit_rfBLT$pred.ci
+  )
+}
+
+# 2. Execute using lapply (or future_lapply for parallel speed)
+results_seasonal <- lapply(1:df_nrow, process_seasonal_rfBLT, 
+                           df_true = df_true, 
+                           df_air = df_air, 
+                           pred_size = pred_size, 
+                           window_size = embed_dim[which.min(final_mean_mse_6m)])
+
+# 3. Aggregate results back into your original structures
+coef_rfBLTs_list   <- lapply(results_seasonal, `[[`, "coef")
+sigma2_rfBLTs_list <- lapply(results_seasonal, `[[`, "sigma2")
+ess_rfBLTs_list    <- lapply(results_seasonal, `[[`, "ess")
+pred_seasonal_list <- lapply(results_seasonal, `[[`, "pred_seasonal")
+
+# Map values back to matrices
+df_residuals_seasonal_acf <- matrix(NA, nrow=df_nrow, ncol=70)
+df_residuals_seasonal_acf[,1] <- df_true[,1]
+colnames(df_residuals_seasonal_acf) <- c("training_point", paste0(0:(ncol(df_residuals_seasonal_acf)-2)))
+
+df_residuals_seasonal_acf[, -1] <- do.call(rbind, lapply(results_seasonal, `[[`, "acf"))
+df_pred_seasonal[, 2:df_ncol]    <- do.call(rbind, lapply(results_seasonal, `[[`, "y_pred"))
+df_lower_seasonal[, 2:df_ncol]   <- do.call(rbind, lapply(results_seasonal, function(x) x$ci[, 1]))
+df_upper_seasonal[, 2:df_ncol]   <- do.call(rbind, lapply(results_seasonal, function(x) x$ci[, 2]))
+
+# Fill the training residual matrix (accounting for potential length differences)
+residual_seasonal_train_mat <- matrix(NA, nrow=df_nrow, ncol=nrow(df_air))
+for(i in 1:df_nrow) {
+  resids <- results_seasonal[[i]]$residuals
+  residual_seasonal_train_mat[i, 1:length(resids)] <- resids
+}
+
+# --- Save diagnostic result ---
+# Effective sample size
+pdf("rfBLTs_6m_ess.pdf", width=7, height=5)
+par(mfrow=c(1, 1))
+for (i in 1:df_nrow){
+    plot(ess_rfBLTs_list[[i]])
+}
+dev.off()
+
+# ACF and QQ plots of residuals
+pdf("rfBLTs_6m_residuals.pdf", width=10, height=4)
+par(mfrow=c(1, 2))
+for (i in 1:nrow(df_residuals_seasonal_acf)){
+  # ACF of residuals
+  plot(df_residuals_seasonal_acf[i, -1], type="h", ylab="ACF", xlab="Lag", main=paste(i))
+  # QQ plot of residuals
+  qqnorm(na.omit(residual_seasonal_train_mat[i,]), main=paste(i))
+  qqline(na.omit(residual_seasonal_train_mat[i,]))
+}
+dev.off()
+
+# Trace plots of coefficients
+pdf("rfBLTs_6m_coefs_samples.pdf", width=15, height=20)
+par(mfrow=c(6, 3))
+for (i in 1:ncol(coef_rfBLTs_list[[df_nrow]])){
+  plot(coef_rfBLTs_list[[df_nrow]][,i], type="l", main=paste0("Tract plot of Beta ", i-1), ylab=paste0("Beta ", i-1))
+  hist(coef_rfBLTs_list[[df_nrow]][,i], probability = TRUE, main=paste0("Density of Beta ", i-1), xlab=paste0("Beta ", i-1))
+  boxplot(coef_rfBLTs_list[[df_nrow]][,i], horizontal=TRUE, main=paste0("Box plot of Beta ", i-1))
+}
+dev.off()
+
+# Trace plot of sigma2
+pdf("rfBLTs_6m_sigma2_samples.pdf", width=15, height=4)
+par(mfrow=c(1, 3))
+plot(sigma2_rfBLTs_list[[df_nrow]], type="l", ylab="Sigma2", main="Trace plot of Sigma2")
+hist(sigma2_rfBLTs_list[[df_nrow]], probability = TRUE, main=paste0("Density of Sigma2"), xlab=paste0("Sigma2"))
+boxplot(sigma2_rfBLTs_list[[df_nrow]], horizontal=TRUE, main="Box plot of Sigma2")
+dev.off()
+```
+
+```{r}
+# --- Combine all for X11-rfBLT ---
+df_ncol <- ncol(df_true)
+df_nrow <- nrow(df_true)
+alpha <- 0.05
+
+combine_pred_rfBLT_TRS_x11_list <- list()
+
+df_pred_rfBLT_TRS_x11_all <- matrix(NA, ncol=ncol(df_true), nrow=nrow(df_true))
+df_pred_rfBLT_TRS_x11_all[,1] <- df_true[,1]
+df_lower_rfBLT_TRS_x11_all <- df_pred_rfBLT_TRS_x11_all
+df_upper_rfBLT_TRS_x11_all <- df_pred_rfBLT_TRS_x11_all
+
+colnames(df_pred_rfBLT_TRS_x11_all) <- c("training_point", paste0("t",1:pred_size))
+colnames(df_lower_rfBLT_TRS_x11_all) <- c("training_point", paste0("t",1:pred_size))
+colnames(df_upper_rfBLT_TRS_x11_all) <- c("training_point", paste0("t",1:pred_size))
+
+for (i in 1:length(pred_trend_list)){
+  combine_pred_rfBLT_TRS_x11_list[[i]] <- pred_seasonal_list[[i]]*pred_trend_list[[i]]
+  pred_all_sample <- t(pred_seasonal_list[[i]]*pred_trend_list[[i]])
+  
+  pred_post_all_mean <- rowMeans(pred_all_sample)
+  pred_post_all_lower <- rep(NA, pred_size)
+  pred_post_all_upper <- rep(NA, pred_size)
+  for (j in 1:pred_size){
+    pred_post_all_lower[j] <- quantile(pred_all_sample[j,], prob=alpha/2)
+    pred_post_all_upper[j] <- quantile(pred_all_sample[j,], prob=1-alpha/2)
+  } 
+  
+  df_pred_rfBLT_TRS_x11_all[i, 2:df_ncol] <- pred_post_all_mean
+  df_lower_rfBLT_TRS_x11_all[i, 2:df_ncol] <- pred_post_all_lower
+  df_upper_rfBLT_TRS_x11_all[i, 2:df_ncol] <- pred_post_all_upper
+}
+```
+
+```{r}
+# --- SARIMA ---
+df_pred_sarima <- df_true
+df_lower_sarima <- df_true
+df_upper_sarima <- df_true
+ 
+for (i in 1:df_nrow){
+   # Train data vec 
+   vec_data <- ts(df_air$passengers[1:df_true[i,1]], start = c(1949,  01), frequency = 12)
+   
+   # Fit seasonal ARIMA
+   sarima_fit <- auto.arima(vec_data, seasonal="TRUE")
+   
+   # Forecast
+   sarima_forecast_values <- forecast(sarima_fit, h=pred_size)
+   
+   df_pred_sarima[i, 2:df_ncol] <- as.vector(sarima_forecast_values$mean)
+   df_lower_sarima[i, 2:df_ncol] <- as.vector(sarima_forecast_values$lower[,2])
+   df_upper_sarima[i, 2:df_ncol] <- as.vector(sarima_forecast_values$upper[,2])
+}
+```
+
+```{r}
+# --- Holt-Winters’ additive method ---
+df_pred_hw_additive <- df_true
+df_lower_hw_additive <- df_true
+df_upper_hw_additive <- df_true
+
+for (i in 1:df_nrow){
+  # Train data vec 
+  vec_data <- ts(df_air$passengers[1:df_true[i,1]], start = c(1949,  01), frequency = 12)
+  
+  # Fit HW
+  hw_additive_fit <- ets(vec_data, model = "AAA") # HoltWinters(vec_data, seasonal = "additive")
+  
+  # Forecast
+  hw_additive_forecast_values <- forecast(hw_additive_fit, h=pred_size)
+  
+  df_pred_hw_additive[i, 2:df_ncol] <- as.vector(hw_additive_forecast_values$mean)
+  df_lower_hw_additive[i, 2:df_ncol] <- as.vector(hw_additive_forecast_values$lower[,2])
+  df_upper_hw_additive[i, 2:df_ncol] <- as.vector(hw_additive_forecast_values$upper[,2])
+}
+```
+
+```{r}
+# -- TBATS ---
+df_pred_tbats <- df_true
+df_lower_tbats <- df_true
+df_upper_tbats <- df_true
+
+for (i in 1:df_nrow){
+  # Train data vec 
+  vec_data <- ts(df_air$passengers[1:df_true[i,1]], start = c(1949,  01), frequency = 12)
+  
+  # Fit TBATS
+  tbats_fit <-tbats(vec_data) 
+  
+  # Forecast
+  tbats_forecast_values <- forecast(tbats_fit, h=pred_size)
+  
+  df_pred_tbats[i, 2:df_ncol] <- as.vector(tbats_forecast_values$mean)
+  df_lower_tbats[i, 2:df_ncol] <- as.vector(tbats_forecast_values$lower[,2])
+  df_upper_tbats[i, 2:df_ncol] <- as.vector(tbats_forecast_values$upper[,2])
+}
+```
+
+```{r}
+# --- STL ---
+df_pred_slt <- df_true
+df_lower_slt <- df_true
+df_upper_slt <- df_true
+
+for (i in 1:df_nrow){
+  # Train data vec 
+  vec_data <- ts(df_air$passengers[1:df_true[i,1]], start = c(1949,  01), frequency = 12)
+  
+  # Fit SLT
+  slt_fit <- stlf(vec_data, method='arima')
+  
+  # Forecast
+  slt_forecast_values <- forecast(slt_fit, h=pred_size)
+  
+  df_pred_slt[i, 2:df_ncol] <- as.vector(slt_forecast_values$mean)
+  df_lower_slt[i, 2:df_ncol] <- as.vector(slt_forecast_values$lower[,2])
+  df_upper_slt[i, 2:df_ncol] <- as.vector(slt_forecast_values$upper[,2])
+}
+```
+
+```{r}
+# --- Dynamic Harmonic Regression ---
+best_k <- 1
+min_aicc <- Inf
+
+ts_data <- ts(df_air$passengers[1:df_true[1,1]], start = c(1949,  01), frequency = 12)
+
+for(i in 1:6) {
+  fit <- auto.arima(ts_data, xreg=fourier(ts_data, K=i), seasonal=FALSE)
+  if(fit$aicc < min_aicc) {
+    min_aicc <- fit$aicc
+    best_k <- i
+  }
+}
+best_k
+
+df_pred_dhr <- df_true
+df_lower_dhr <- df_true
+df_upper_dhr <- df_true
+
+for (i in 1:df_nrow){
+  # Train data vec 
+  vec_data <- ts(df_air$passengers[1:df_true[i,1]], start = c(1949,  01), frequency = 12)
+  
+  # Fit DHR
+  dhr_fit <-auto.arima(vec_data, xreg=fourier(vec_data, K=best_k), seasonal=FALSE)
+  
+  # Forecast
+  dhr_forecast_values <- forecast(dhr_fit, xreg=fourier(vec_data, K=best_k, h=pred_size))
+  
+  df_pred_dhr[i, 2:df_ncol] <- as.vector(dhr_forecast_values$mean)
+  df_lower_dhr[i, 2:df_ncol] <- as.vector(dhr_forecast_values$lower[,2])
+  df_upper_dhr[i, 2:df_ncol] <- as.vector(dhr_forecast_values$upper[,2])
+}
+```
+
+```{r}
+# --- Save results ---
+save(# Short-term
+    df_true, 
+
+    # SARIMA 
+    df_pred_sarima, 
+    df_lower_sarima, 
+    df_upper_sarima, 
+
+    # HW add
+    df_pred_hw_additive, 
+    df_lower_hw_additive, 
+    df_upper_hw_additive,
+
+    # TBATS
+    df_pred_tbats, 
+    df_lower_tbats, 
+    df_upper_tbats,
+
+    # SLT
+    df_pred_slt,
+    df_lower_slt, 
+    df_upper_slt, 
+
+    # DHR
+    df_pred_dhr, 
+    df_lower_dhr, 
+    df_upper_dhr,
+    
+    # rfBLT
+    combine_pred_rfBLT_TRS_x11_list,
+    mse_matrix_6m,
+    df_pred_rfBLT_TRS_x11_all,
+    df_lower_rfBLT_TRS_x11_all,
+    df_upper_rfBLT_TRS_x11_all,
+
+    file = "200726_air_passengers_x11_pred_6m_results.RData"
+)
+
+# Save diagnostic results
+save(residual_trend_train_mat,
+     df_residuals_acf,
+
+     # Predict trend using rfBLT
+     pred_trend_list,
+     coef_list,
+     sigma2_list,
+     ess_list,
+    
+     df_pred_rfBLT, 
+     df_lower_rfBLT,
+     df_upper_rfBLT,
+     
+     file = "200726_air_passengers_x11_trend_pred_6m_results.RData")
+
+save(residual_seasonal_train_mat, 
+     df_residuals_seasonal_acf,
+     
+     # Predict seasonal part for rfBLT and rfBL
+     pred_seasonal_list,
+     coef_rfBLTs_list,
+     sigma2_rfBLTs_list,
+     ess_rfBLTs_list,  
+    
+     df_pred_seasonal,
+     df_lower_seasonal,
+     df_upper_seasonal,
+    
+     file = "200726_air_passengers_x11_seasonal_pred_6m_results.RData")
+```
+
+```{r}
+# Load result
+load("D:/Dalhousie University/0. Project/X11-rfBLT/Air Passengers/200726_air_passengers_x11_pred_6m_results.RData")
+keep_point <- seq(min(df_true[,1]), max(df_true[,1]), 15)
+df_time <- data.frame(forecast_day=(fixed_point+1):nrow(df_air), 
+                      month=as.character(df_air$date[(fixed_point+1):nrow(df_air)]))
+```
+
+```{r}
+print("Cross-validation Mean MSE")
+mse_matrix_6m
+rowMeans(mse_matrix_6m)
+embed_dim[which.min(rowMeans(mse_matrix_6m))]
+
+print("Cross-validation Log Mean MSE")
+log(mse_matrix_6m)
+```
+
+```{r}
+# ---- Visualization ----
+# --- rfBLT ---
+res_rfBLT <- coverage_fn(
+  df_true = df_true,
+  df_upper = df_upper_rfBLT_TRS_x11_all,
+  df_lower = df_lower_rfBLT_TRS_x11_all
+)
+
+# Create a forecast dataframe
+rfBLT_output_df <- create_forecast_df(
+  dat_vec = as.vector(df_air$passengers), 
+  df_true = df_true, 
+  df_pred = df_pred_rfBLT_TRS_x11_all, 
+  df_lower = df_lower_rfBLT_TRS_x11_all, 
+  df_upper = df_upper_rfBLT_TRS_x11_all, 
+  start_index = fixed_point,
+  end_index = nrow(df_air))
+
+rfBLT_output_df <- merge(rfBLT_output_df, df_time, by = "forecast_day", all.x = TRUE)
+rfBLT_output_df$month <- ymd(rfBLT_output_df$month)
+
+p_rfBLT_full <- ggplot(rfBLT_output_df, aes(x = month)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95, group = train_time, fill = "95% CI"),
+              alpha = 0.1) +
+  geom_line(aes(y = predicted_mean, group = train_time, color = "Predicted Mean"), 
+            alpha = 2, size=1) +
+  geom_line(aes(y = observed, color = "Observed"), size = 1, alpha = 0.7) +
+  labs(title = "X11-rfBLT",
+       x = "Month", y = "Number of Passengers",
+       color = "Legend", fill = "Legend") +
+  scale_color_manual(values = c("Predicted Mean" = "red", "Observed" = "black")) +
+  scale_fill_manual(values = c("95% CI" = "blue")) +
+  theme_minimal() +
+  theme(legend.position = "top", 
+        legend.title = element_blank(),
+        plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))+
+  coord_cartesian(ylim = c(150, 710))
+
+filtered_rfBLT_output_df <- rfBLT_output_df %>%
+  mutate(
+    predicted_mean = ifelse(train_time %in% keep_point, predicted_mean, NA_real_),
+    lower_95       = ifelse(train_time %in% keep_point, lower_95, NA_real_),
+    upper_95       = ifelse(train_time %in% keep_point, upper_95, NA_real_)
+  )
+
+# Visualize the expanding window forecasting
+p_rfBLT_filtered <- ggplot(filtered_rfBLT_output_df, aes(x = month)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95, group = train_time, fill = "95% CI"),
+              alpha = 0.1) +
+  geom_line(aes(y = predicted_mean, group = train_time, color = "Predicted Mean"), 
+            alpha = 2, size=1) +
+  geom_line(aes(y = observed, color = "Observed"), size = 1, alpha = 0.7) +
+  labs(title = "X11-rfBLT",
+       x = "Month", y = "Number of Passengers",
+       color = "Legend", fill = "Legend") +
+  scale_color_manual(values = c("Predicted Mean" = "red", "Observed" = "black")) +
+  scale_fill_manual(values = c("95% CI" = "blue")) +
+  theme_minimal() +
+  theme(legend.position = "top", 
+        legend.title = element_blank(),
+        plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))+
+  coord_cartesian(ylim = c(150, 710))
+
+# --- SARIMA ---
+res_sarima <- coverage_fn(
+  df_true = df_true,
+  df_upper = df_upper_sarima,
+  df_lower = df_lower_sarima
+)
+
+# Create a forecast dataframe
+sarima_output_df <- create_forecast_df(
+  dat_vec = as.vector(df_air$passengers), 
+  df_true = df_true, 
+  df_pred = df_pred_sarima, 
+  df_lower = df_lower_sarima, 
+  df_upper = df_upper_sarima, 
+  start_index = fixed_point,
+  end_index = nrow(df_air))
+
+sarima_output_df <- merge(sarima_output_df, df_time, by = "forecast_day", all.x = TRUE)
+sarima_output_df$month <- ymd(sarima_output_df$month)
+
+p_sarima_full <- ggplot(sarima_output_df, aes(x = month)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95, group = train_time, fill = "95% CI"),
+              alpha = 0.1) +
+  geom_line(aes(y = predicted_mean, group = train_time, color = "Predicted Mean"), 
+            alpha = 2, size=1) +
+  geom_line(aes(y = observed, color = "Observed"), size = 1, alpha = 0.7) +
+  labs(title = "SARIMA",
+       x = "Month", y = "Number of Passengers",
+       color = "Legend", fill = "Legend") +
+  scale_color_manual(values = c("Predicted Mean" = "red", "Observed" = "black")) +
+  scale_fill_manual(values = c("95% CI" = "blue")) +
+  theme_minimal() +
+  theme(legend.position = "top", 
+        legend.title = element_blank(),
+        plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))+
+  coord_cartesian(ylim = c(150, 710))
+
+filtered_sarima_output_df <- sarima_output_df %>%
+  mutate(
+    predicted_mean = ifelse(train_time %in% keep_point, predicted_mean, NA_real_),
+    lower_95       = ifelse(train_time %in% keep_point, lower_95, NA_real_),
+    upper_95       = ifelse(train_time %in% keep_point, upper_95, NA_real_)
+  )
+
+# Visualize the expanding window forecasting
+p_sarima_filtered <- ggplot(filtered_sarima_output_df, aes(x = month)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95, group = train_time, fill = "95% CI"),
+              alpha = 0.1) +
+  geom_line(aes(y = predicted_mean, group = train_time, color = "Predicted Mean"), 
+            alpha = 2, size=1) +
+  geom_line(aes(y = observed, color = "Observed"), size = 1, alpha = 0.7) +
+  labs(title = "SARIMA",
+       x = "Month", y = "Number of Passengers",
+       color = "Legend", fill = "Legend") +
+  scale_color_manual(values = c("Predicted Mean" = "red", "Observed" = "black")) +
+  scale_fill_manual(values = c("95% CI" = "blue")) +
+  theme_minimal() +
+  theme(legend.position = "top", 
+        legend.title = element_blank(),
+        plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))+
+  coord_cartesian(ylim = c(150, 710))
+
+# --- Holt-Winters’ Additive ---
+res_hw_additive <- coverage_fn(
+  df_true = df_true,
+  df_upper = df_upper_hw_additive,
+  df_lower = df_lower_hw_additive
+)
+
+# Create a forecast dataframe
+hw_additive_output_df <- create_forecast_df(
+  dat_vec = as.vector(df_air$passengers), 
+  df_true = df_true, 
+  df_pred = df_pred_hw_additive, 
+  df_lower = df_lower_hw_additive, 
+  df_upper = df_upper_hw_additive, 
+  start_index = fixed_point,
+  end_index = nrow(df_air))
+
+hw_additive_output_df <- merge(hw_additive_output_df, df_time, by = "forecast_day", all.x = TRUE)
+hw_additive_output_df$month <- ymd(hw_additive_output_df$month)
+
+p_hw_additive_full <- ggplot(hw_additive_output_df, aes(x = month)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95, group = train_time, fill = "95% CI"),
+              alpha = 0.1) +
+  geom_line(aes(y = predicted_mean, group = train_time, color = "Predicted Mean"), 
+            alpha = 2, size=1) +
+  geom_line(aes(y = observed, color = "Observed"), size = 1, alpha = 0.7) +
+  labs(title = "Holt-Winters' Additive",
+       x = "Month", y = "Number of Passengers",
+       color = "Legend", fill = "Legend") +
+  scale_color_manual(values = c("Predicted Mean" = "red", "Observed" = "black")) +
+  scale_fill_manual(values = c("95% CI" = "blue")) +
+  theme_minimal() +
+  theme(legend.position = "top", 
+        legend.title = element_blank(),
+        plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))+
+  coord_cartesian(ylim = c(150, 710))
+
+filtered_hw_additive_output_df <- hw_additive_output_df %>%
+  mutate(
+    predicted_mean = ifelse(train_time %in% keep_point, predicted_mean, NA_real_),
+    lower_95       = ifelse(train_time %in% keep_point, lower_95, NA_real_),
+    upper_95       = ifelse(train_time %in% keep_point, upper_95, NA_real_)
+  )
+
+# Visualize the expanding window forecasting
+p_hw_additive_filtered <- ggplot(filtered_hw_additive_output_df, aes(x = month)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95, group = train_time, fill = "95% CI"),
+              alpha = 0.1) +
+  geom_line(aes(y = predicted_mean, group = train_time, color = "Predicted Mean"), 
+            alpha = 2, size=1) +
+  geom_line(aes(y = observed, color = "Observed"), size = 1, alpha = 0.7) +
+  labs(title = "Holt-Winters' Additive",
+       x = "Month", y = "Number of Passengers",
+       color = "Legend", fill = "Legend") +
+  scale_color_manual(values = c("Predicted Mean" = "red", "Observed" = "black")) +
+  scale_fill_manual(values = c("95% CI" = "blue")) +
+  theme_minimal() +
+  theme(legend.position = "top", 
+        legend.title = element_blank(),
+        plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))+
+  coord_cartesian(ylim = c(150, 710))
+
+# --- STL ---
+res_slt <- coverage_fn(
+  df_true = df_true,
+  df_upper = df_upper_slt,
+  df_lower = df_lower_slt
+)
+
+# Create a forecast dataframe
+slt_output_df <- create_forecast_df(
+  dat_vec = as.vector(df_air$passengers), 
+  df_true = df_true, 
+  df_pred = df_pred_slt, 
+  df_lower = df_lower_slt, 
+  df_upper = df_upper_slt, 
+  start_index = fixed_point,
+  end_index = nrow(df_air))
+
+slt_output_df <- merge(slt_output_df, df_time, by = "forecast_day", all.x = TRUE)
+slt_output_df$month <- ymd(slt_output_df$month)
+
+p_slt_full <- ggplot(slt_output_df, aes(x = month)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95, group = train_time, fill = "95% CI"),
+              alpha = 0.1) +
+  geom_line(aes(y = predicted_mean, group = train_time, color = "Predicted Mean"), 
+            alpha = 2, size=1) +
+  geom_line(aes(y = observed, color = "Observed"), size = 1, alpha = 0.7) +
+  labs(title = "STL",
+       x = "Month", y = "Number of Passengers",
+       color = "Legend", fill = "Legend") +
+  scale_color_manual(values = c("Predicted Mean" = "red", "Observed" = "black")) +
+  scale_fill_manual(values = c("95% CI" = "blue")) +
+  theme_minimal() +
+  theme(legend.position = "top", 
+        legend.title = element_blank(),
+        plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))+
+  coord_cartesian(ylim = c(150, 710))
+
+filtered_slt_output_df <- slt_output_df %>%
+  mutate(
+    predicted_mean = ifelse(train_time %in% keep_point, predicted_mean, NA_real_),
+    lower_95       = ifelse(train_time %in% keep_point, lower_95, NA_real_),
+    upper_95       = ifelse(train_time %in% keep_point, upper_95, NA_real_)
+  )
+
+# Visualize the expanding window forecasting
+p_slt_filtered <- ggplot(filtered_slt_output_df, aes(x = month)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95, group = train_time, fill = "95% CI"),
+              alpha = 0.1) +
+  geom_line(aes(y = predicted_mean, group = train_time, color = "Predicted Mean"), 
+            alpha = 2, size=1) +
+  geom_line(aes(y = observed, color = "Observed"), size = 1, alpha = 0.7) +
+  labs(title = "STL",
+       x = "Month", y = "Number of Passengers",
+       color = "Legend", fill = "Legend") +
+  scale_color_manual(values = c("Predicted Mean" = "red", "Observed" = "black")) +
+  scale_fill_manual(values = c("95% CI" = "blue")) +
+  theme_minimal() +
+  theme(legend.position = "top", 
+        legend.title = element_blank(),
+        plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))+
+  coord_cartesian(ylim = c(150, 710))
+
+# --- DHR ---
+res_dhr <- coverage_fn(
+  df_true = df_true,
+  df_upper = df_upper_dhr,
+  df_lower = df_lower_dhr
+)
+
+# Create a forecast dataframe
+dhr_output_df <- create_forecast_df(
+  dat_vec = as.vector(df_air$passengers), 
+  df_true = df_true, 
+  df_pred = df_pred_dhr, 
+  df_lower = df_lower_dhr, 
+  df_upper = df_upper_dhr, 
+  start_index = fixed_point,
+  end_index = nrow(df_air))
+
+dhr_output_df <- merge(dhr_output_df, df_time, by = "forecast_day", all.x = TRUE)
+dhr_output_df$month <- ymd(dhr_output_df$month)
+
+p_dhr_full <- ggplot(dhr_output_df, aes(x = month)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95, group = train_time, fill = "95% CI"),
+              alpha = 0.1) +
+  geom_line(aes(y = predicted_mean, group = train_time, color = "Predicted Mean"), 
+            alpha = 2, size=1) +
+  geom_line(aes(y = observed, color = "Observed"), size = 1, alpha = 0.7) +
+  labs(title = "Dynamic Harmonic Regression",
+       x = "Month", y = "Number of Passengers",
+       color = "Legend", fill = "Legend") +
+  scale_color_manual(values = c("Predicted Mean" = "red", "Observed" = "black")) +
+  scale_fill_manual(values = c("95% CI" = "blue")) +
+  theme_minimal() +
+  theme(legend.position = "top", 
+        legend.title = element_blank(),
+        plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))+
+  coord_cartesian(ylim = c(150, 710))
+
+filtered_dhr_output_df <- dhr_output_df %>%
+  mutate(
+    predicted_mean = ifelse(train_time %in% keep_point, predicted_mean, NA_real_),
+    lower_95       = ifelse(train_time %in% keep_point, lower_95, NA_real_),
+    upper_95       = ifelse(train_time %in% keep_point, upper_95, NA_real_)
+  )
+
+# Visualize the expanding window forecasting
+p_dhr_filtered <- ggplot(filtered_dhr_output_df, aes(x = month)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95, group = train_time, fill = "95% CI"),
+              alpha = 0.1) +
+  geom_line(aes(y = predicted_mean, group = train_time, color = "Predicted Mean"), 
+            alpha = 2, size=1) +
+  geom_line(aes(y = observed, color = "Observed"), size = 1, alpha = 0.7) +
+  labs(title = "Dynamic Harmonic Regression",
+       x = "Month", y = "Number of Passengers",
+       color = "Legend", fill = "Legend") +
+  scale_color_manual(values = c("Predicted Mean" = "red", "Observed" = "black")) +
+  scale_fill_manual(values = c("95% CI" = "blue")) +
+  theme_minimal() +
+  theme(legend.position = "top", 
+        legend.title = element_blank(),
+        plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))+
+  coord_cartesian(ylim = c(150, 710))
+
+# --- TBATS ---
+res_tbats <- coverage_fn(
+  df_true = df_true,
+  df_upper = df_upper_tbats,
+  df_lower = df_lower_tbats
+)
+
+# Create a forecast dataframe
+tbats_output_df <- create_forecast_df(
+  dat_vec = as.vector(df_air$passengers), 
+  df_true = df_true, 
+  df_pred = df_pred_tbats, 
+  df_lower = df_lower_tbats, 
+  df_upper = df_upper_tbats, 
+  start_index = fixed_point,
+  end_index = nrow(df_air))
+
+tbats_output_df <- merge(tbats_output_df, df_time, by = "forecast_day", all.x = TRUE)
+tbats_output_df$month <- ymd(tbats_output_df$month)
+
+p_tbats_full <- ggplot(tbats_output_df, aes(x = month)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95, group = train_time, fill = "95% CI"),
+              alpha = 0.1) +
+  geom_line(aes(y = predicted_mean, group = train_time, color = "Predicted Mean"), 
+            alpha = 2, size=1) +
+  geom_line(aes(y = observed, color = "Observed"), size = 1, alpha = 0.7) +
+  labs(title = "TBATS",
+       x = "Month", y = "Number of Passengers",
+       color = "Legend", fill = "Legend") +
+  scale_color_manual(values = c("Predicted Mean" = "red", "Observed" = "black")) +
+  scale_fill_manual(values = c("95% CI" = "blue")) +
+  theme_minimal() +
+  theme(legend.position = "top", 
+        legend.title = element_blank(),
+        plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))+
+  coord_cartesian(ylim = c(150, 710))
+
+filtered_tbats_output_df <- tbats_output_df %>%
+  mutate(
+    predicted_mean = ifelse(train_time %in% keep_point, predicted_mean, NA_real_),
+    lower_95       = ifelse(train_time %in% keep_point, lower_95, NA_real_),
+    upper_95       = ifelse(train_time %in% keep_point, upper_95, NA_real_)
+  )
+
+# Visualize the expanding window forecasting
+p_tbats_filtered <- ggplot(filtered_tbats_output_df, aes(x = month)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95, group = train_time, fill = "95% CI"),
+              alpha = 0.1) +
+  geom_line(aes(y = predicted_mean, group = train_time, color = "Predicted Mean"), 
+            alpha = 2, size=1) +
+  geom_line(aes(y = observed, color = "Observed"), size = 1, alpha = 0.7) +
+  labs(title = "TBATS",
+       x = "Month", y = "Number of Passengers",
+       color = "Legend", fill = "Legend") +
+  scale_color_manual(values = c("Predicted Mean" = "red", "Observed" = "black")) +
+  scale_fill_manual(values = c("95% CI" = "blue")) +
+  theme_minimal() +
+  theme(legend.position = "top", 
+        legend.title = element_blank(),
+        plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))+
+  coord_cartesian(ylim = c(150, 710))
+```
+
+```{r, fig.height=10, fig.width=12, warning=FALSE}
+pdf("D:/Dalhousie University/0. Project/latex/rfBLT/rfBLT seasonal/air_6m_forecast_full.pdf", width=12, height=8)
+(p_rfBLT_full | p_sarima_full)/(p_hw_additive_full | p_slt_full)/(p_dhr_full | p_tbats_full)
+dev.off()
+```
+
+```{r, fig.height=10, fig.width=12, warning=FALSE}
+pdf("D:/Dalhousie University/0. Project/latex/rfBLT/rfBLT seasonal/air_6m_forecast_filtered.pdf", width = 12, height = 8)
+(p_rfBLT_filtered | p_sarima_filtered)/(p_hw_additive_filtered | p_slt_filtered)/(p_dhr_filtered | p_tbats_filtered)
+dev.off()
+```
+
+```{r}
+# --- MSE ---
+sarima_mse_all_day = rowMeans((df_true[,-1] - df_pred_sarima[,-1])^2) 
+hw_additive_mse_all_day = rowMeans((df_true[,-1] - df_pred_hw_additive[,-1])^2) 
+tbats_mse_all_day = rowMeans((df_true[,-1] - df_pred_tbats[,-1])^2) 
+slt_mse_all_day = rowMeans((df_true[,-1] - df_pred_slt[,-1])^2) 
+dhr_mse_all_day = rowMeans((df_true[,-1] - df_pred_dhr[,-1])^2)
+rfBLT_mse_all_day = rowMeans((df_true[,-1] - df_pred_rfBLT_TRS_x11_all[,-1])^2)
+
+mse_df <- data.frame(
+  rfBLT = rfBLT_mse_all_day, 
+  sarima = sarima_mse_all_day, 
+  hwa = hw_additive_mse_all_day, 
+  slt = slt_mse_all_day, 
+  dhr = dhr_mse_all_day, 
+  tbats = tbats_mse_all_day
+)
+
+# Reshape to long format
+mse_long <- pivot_longer(log(mse_df), 
+                         cols = everything(),
+                         names_to = "Method",
+                         values_to = "MSE")
+
+# Rename methods to match the desired labels
+method_labels <- c("rfBLT", "SARIMA", "HWA", "STL", "DHR", "TBATS")
+names(method_labels) <- names(mse_df)
+mse_long$Method <- method_labels[mse_long$Method]
+mse_long$Method <- factor(mse_long$Method, levels = unique(mse_long$Method))
+
+# --- DEFINE YOUR TRUE MIXED RADIANT PALETTE ---
+mixed_radiant_palette <- c(
+  "rfBLT"  = "#2B6CB0", # Radiant Blue
+  "SARIMA" = "#9B2C2C", # Radiant Red
+  "HWA"    = "#6B46C1", # Radiant Purple
+  "STL"    = "#2F855A", # Radiant Green
+  "DHR"    = "#C05621", # Radiant Orange
+  "TBATS"  = "#2C7A7B"  # Radiant Teal
+)
+
+# Create ggplot
+mse_plot <- ggplot(mse_long, aes(x = Method, y = MSE, color = Method)) + # Mapping changed from fill to color
+  
+  # --- THE FIX: Force inside to be white, adjust border thickness ---
+  geom_boxplot(fill = "white", size = 0.8, outlier.size = 1.5) +  
+  # ------------------------------------------------------------------
+  
+  labs(
+       x = "Methods",
+       y = "log(MSE)") +
+  theme_minimal() +
+  theme(legend.position = "none", 
+        legend.title = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(size = 14),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12)) +
+  # --- THE FIX: Use manual color scaling instead of fill scaling ---
+  scale_color_manual(values = mixed_radiant_palette)
+
+mse_plot
+round(colMedians(as.matrix(log(mse_df))), 4)
+ggsave("D:/Dalhousie University/0. Project/latex/rfBLT/rfBLT seasonal/air_mse.pdf", plot = mse_plot, width = 5, height = 5, units = "in")
+```
+
+```{r}
+# --- Coverage Probability ---
+# SARIMA
+sarima_cover <- coverage_fn(df_true=df_true, df_upper=df_upper_sarima, df_lower=df_lower_sarima)
+sarima_cover_long <- as.data.frame(t(sarima_cover$prop_cover[-1])) %>%
+  pivot_longer(cols = starts_with("t"),
+               names_to = "Month",
+               values_to = "Coverage") %>%
+  mutate(Month = as.numeric(gsub("t", "", Month)),
+         Method = "SARIMA")
+
+# HW additive
+hw_cover <- coverage_fn(df_true=df_true, df_upper=df_upper_hw_additive, df_lower=df_lower_hw_additive)
+hw_cover_long <- as.data.frame(t(hw_cover$prop_cover[-1])) %>%
+  pivot_longer(cols = starts_with("t"),
+               names_to = "Month",
+               values_to = "Coverage") %>%
+  mutate(Month = as.numeric(gsub("t", "", Month)),
+         Method = "HW additive")
+
+# TBATS
+tbats_cover <- coverage_fn(df_true=df_true, df_upper=df_upper_tbats, df_lower=df_lower_tbats)
+tbats_cover_long <- as.data.frame(t(tbats_cover$prop_cover[-1])) %>%
+  pivot_longer(cols = starts_with("t"),
+               names_to = "Month",
+               values_to = "Coverage") %>%
+  mutate(Month = as.numeric(gsub("t", "", Month)),
+         Method = "TBATS")
+
+# STL
+slt_cover <- coverage_fn(df_true=df_true, df_upper=df_upper_slt, df_lower=df_lower_slt)
+slt_cover_long <- as.data.frame(t(slt_cover$prop_cover[-1])) %>%
+  pivot_longer(cols = starts_with("t"),
+               names_to = "Month",
+               values_to = "Coverage") %>%
+  mutate(Month = as.numeric(gsub("t", "", Month)),
+         Method = "STL")
+
+# DHR
+dhr_cover <- coverage_fn(df_true=df_true, df_upper=df_upper_dhr, df_lower=df_lower_dhr)
+dhr_cover_long <- as.data.frame(t(dhr_cover$prop_cover[-1])) %>%
+  pivot_longer(cols = starts_with("t"),
+               names_to = "Month",
+               values_to = "Coverage") %>%
+  mutate(Month = as.numeric(gsub("t", "", Month)),
+         Method = "DHR")
+
+# rfBLT
+rfBLT_cover <- coverage_fn(df_true=df_true, df_upper=df_upper_rfBLT_TRS_x11_all, df_lower=df_lower_rfBLT_TRS_x11_all)
+rfBLT_cover_long <- as.data.frame(t(rfBLT_cover$prop_cover[-1])) %>%
+  pivot_longer(cols = starts_with("t"),
+               names_to = "Month",
+               values_to = "Coverage") %>%
+  mutate(Month = as.numeric(gsub("t", "", Month)),
+         Method = "rfBLT")
+
+combine_cover_df <- rbind(rfBLT_cover_long,
+                          sarima_cover_long, 
+                          hw_cover_long,
+                          slt_cover_long,
+                          dhr_cover_long,
+                          tbats_cover_long)
+
+combine_cover_df$Method <- factor(combine_cover_df$Method, levels = unique(combine_cover_df$Method))
+
+# Result
+df_cover_prob <- rbind(rfBLT_cover$prop_cover[-1], 
+                       sarima_cover$prop_cover[-1], 
+                       hw_cover$prop_cover[-1], 
+                       slt_cover$prop_cover[-1], 
+                       dhr_cover$prop_cover[-1], 
+                       tbats_cover$prop_cover[-1])
+
+row.names(df_cover_prob) <- c("rfBLT", "SARIMA", "HWA", "STL", "DHR", "TBATS")
+round(df_cover_prob*100, 2)
+```
+
+```{r}
+# --- Coverage range ---
+df_ncol <- ncol(df_true)
+
+# SARIMA
+sarima_cr_range_long <- as.data.frame(t(colMedians(as.matrix(sarima_cover$cr_range_mat[, 2:df_ncol])))) %>%
+  pivot_longer(cols = starts_with("t"),
+               names_to = "Day",
+               values_to = "Range") %>%
+  mutate(Day = as.numeric(gsub("t", "", Day)),
+         Method = "SARIMA")
+
+# Holt-Winters
+hw_cr_range_long <- as.data.frame(t(colMedians(as.matrix(hw_cover$cr_range_mat[, 2:df_ncol])))) %>%
+  pivot_longer(cols = starts_with("t"),
+               names_to = "Day",
+               values_to = "Range") %>%
+  mutate(Day = as.numeric(gsub("t", "", Day)),
+         Method = "HW additive")
+
+# TBATS
+tbats_cr_range_long <- as.data.frame(t(colMedians(as.matrix(tbats_cover$cr_range_mat[, 2:df_ncol])))) %>%
+  pivot_longer(cols = starts_with("t"),
+               names_to = "Day",
+               values_to = "Range") %>%
+  mutate(Day = as.numeric(gsub("t", "", Day)),
+         Method = "TBATS")
+
+# STL
+slt_cr_range_long <- as.data.frame(t(colMedians(as.matrix(slt_cover$cr_range_mat[, 2:df_ncol])))) %>%
+  pivot_longer(cols = starts_with("t"),
+               names_to = "Day",
+               values_to = "Range") %>%
+  mutate(Day = as.numeric(gsub("t", "", Day)),
+         Method = "STL")
+
+# DHR
+dhr_cr_range_long <- as.data.frame(t(colMedians(as.matrix(dhr_cover$cr_range_mat[, 2:df_ncol])))) %>%
+  pivot_longer(cols = starts_with("t"),
+               names_to = "Day",
+               values_to = "Range") %>%
+  mutate(Day = as.numeric(gsub("t", "", Day)),
+         Method = "DHR")
+
+# rfBLT
+rfBLT_cr_range_long <- as.data.frame(t(colMedians(as.matrix(rfBLT_cover$cr_range_mat[, 2:df_ncol])))) %>%
+  pivot_longer(cols = starts_with("t"),
+               names_to = "Day",
+               values_to = "Range") %>%
+  mutate(Day = as.numeric(gsub("t", "", Day)),
+         Method = "rfBLT")
+
+combine_cr_range_df <- rbind(
+  rfBLT_cr_range_long,
+  sarima_cr_range_long,
+  hw_cr_range_long,
+  slt_cr_range_long,
+  dhr_cr_range_long,
+  tbats_cr_range_long
+)
+
+combine_cr_range_df$Method <- factor(combine_cr_range_df$Method, levels = unique(combine_cr_range_df$Method))
+
+# Result
+df_cover_range <- rbind(colMedians(as.matrix(rfBLT_cover$cr_range_mat[, 2:df_ncol])),
+                        colMedians(as.matrix(sarima_cover$cr_range_mat[, 2:df_ncol])), 
+                        colMedians(as.matrix(hw_cover$cr_range_mat[, 2:df_ncol])),  
+                        colMedians(as.matrix(slt_cover$cr_range_mat[, 2:df_ncol])), 
+                        colMedians(as.matrix(dhr_cover$cr_range_mat[, 2:df_ncol])), 
+                        colMedians(as.matrix(tbats_cover$cr_range_mat[, 2:df_ncol])))
+
+row.names(df_cover_range) <- c("rfBLT", "SARIMA", "HWA", "STL", "DHR", "TBATS")
+round(df_cover_range, 2)
+```
