@@ -533,7 +533,7 @@ create_forecast_df <- function(dat_vec, df_true, df_pred, df_lower, df_upper, st
 # Dataset
 
 ```{r}
-df_temp <- read.csv("D:/Dalhousie University/0. Project/Periodic ts/data/weatherstats_halifax_daily.csv")
+df_temp <- read.csv("D:/Dalhousie University/0. Project/X11-rfBLT/Halifax Temperature/weatherstats_halifax_daily.csv")
 df_temp <- dplyr::slice(df_temp, n():1) # revert the whole data in time order
 df_temp <- df_temp[!is.na(df_temp$avg_temperature), ] # remove all rows having NA in avg_temp
 df_temp$date <- as.Date(df_temp$date)
